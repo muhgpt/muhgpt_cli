@@ -17,6 +17,35 @@ Hard constraints (do not break):
 - Every module has docstrings and tests. Add/adjust tests with any change;
   `python3 -m pytest` must stay green.
 
+  
+## Project structure
+
+```text
+muhgpt_cli/
+├── main.py                  # CLI loop, banner, authorization gate, report export
+├── pyproject.toml           # packaging + `muhgpt` console entry point + pytest config
+├── requirements.txt
+├── .env.example
+├── .gitignore
+├── README.md
+├── muhgpt/
+│   ├── __init__.py
+│   ├── config.py            # .env loading -> immutable Settings
+│   ├── api_client.py        # resilient HTTP client (retries, backoff, error types)
+│   ├── tools.py             # tool schemas + dispatcher + human-in-the-loop
+│   ├── guard.py             # autonomous-mode safety classifier + run budget
+│   ├── mcp.py               # Model Context Protocol client (stdio + HTTP), pure stdlib
+│   ├── arsenal.py           # recon tool catalog + attack-chain playbooks
+│   ├── research.py          # OSINT research sub-agent (relace-search-style delegate)
+│   ├── packages.py          # package-manager detection + install commands
+│   ├── session.py           # JSONL audit log + Markdown report
+│   ├── render.py            # terminal Markdown renderer
+│   ├── bidi.py              # display-only RTL (Arabic) fix
+│   ├── ui.py                # ANSI color theme
+│   └── agent.py             # multi-step tool-use feedback loop
+└── tests/                   # pytest suite (no network — model + HTTP are faked)
+```
+
 ## Layout
 
 ```
