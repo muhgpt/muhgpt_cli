@@ -1,417 +1,252 @@
-# MuhGPT
+# CLAUDE.md
 
-A modular, human-in-the-loop CLI assistant for **authorized** penetration testing
-and OSINT. It talks to your OpenAI-compatible `muh-chat` endpoint, lets the model
-drive predefined local tools via **native function calling**, requires explicit
-operator approval before any command runs, and exports a clean Markdown report.
+Guidance for working in this repo. Read once at session start.
 
-## Project structure
+## What this is
 
-```text
-muhgpt_cli/
-├── main.py                  # CLI loop, banner, authorization gate, report export
-├── pyproject.toml           # packaging + `muhgpt` console entry point + pytest config
-├── requirements.txt
-├── .env.example
-├── .gitignore
-├── README.md
-├── muhgpt/
-│   ├── __init__.py
-│   ├── config.py            # .env loading -> immutable Settings
-│   ├── api_client.py        # resilient HTTP client (retries, backoff, error types)
-│   ├── tools.py             # tool schemas + dispatcher + human-in-the-loop
-│   ├── guard.py             # autonomous-mode safety classifier + run budget
-│   ├── mcp.py               # Model Context Protocol client (stdio + HTTP), pure stdlib
-│   ├── arsenal.py           # recon tool catalog + attack-chain playbooks
-│   ├── packages.py          # package-manager detection + install commands
-│   ├── session.py           # JSONL audit log + Markdown report
-│   ├── render.py            # terminal Markdown renderer
-│   ├── bidi.py              # display-only RTL (Arabic) fix
-│   ├── ui.py                # ANSI color theme
-│   └── agent.py             # multi-step tool-use feedback loop
-└── tests/                   # pytest suite (no network — model + HTTP are faked)
+**MuhGPT** — a human-in-the-loop pentest/OSINT CLI assistant. It talks to an
+OpenAI-compatible chat endpoint (`muh-chat` model), lets the model drive a small
+set of local tools via native function calling, and exports a Markdown
+engagement report. It is **for authorized testing only**.
+
+Hard constraints (do not break):
+- **Pure stdlib + two deps** (`requests`, `python-dotenv`). No new runtime
+  dependencies. Must run on macOS, Linux, and Termux.
+- **Python ≥ 3.9.** Code uses `from __future__ import annotations`, so `X | None`
+  in annotations is fine, but don't use 3.10+ runtime features.
+- Every module has docstrings and tests. Add/adjust tests with any change;
+  `python3 -m pytest` must stay green.
+
+## Layout
+
+```
+main.py            CLI entry: arg parsing, REPL, slash commands, skills, install
+                   routing, autonomous gate, one-shot mode, stream view
+muhgpt/
+  config.py        env -> immutable Settings (MUHGPT_* vars)
+  api_client.py    resilient HTTP client; chat_completion + stream_chat_completion
+                   (SSE) + accumulate_stream(); retries/backoff on 429/5xx/network
+  agent.py         the model<->tool feedback loop; SYSTEM_PROMPT + AUTONOMOUS_SYSTEM_PROMPT
+                   (+ arsenal briefing injected into the system prompt)
+  tools.py         ToolRegistry: execute_terminal_command, install_package, read_file,
+                   save_report, load_skill, note/recall_notes, report_vulnerability;
+                   HITL confirm + auto-approve + exit-127 auto-recovery; MCP dispatch
+  knowledge.py     vuln-playbook KB loader (load_skill/list_skills/skills_index) over muhgpt/skills/
+  skills/          markdown vuln playbooks (xss/sqli/ssrf/idor/… — Strix-style "skills"); package data
+  cvss.py          CVSS 3.1 base score/severity/vector — pure stdlib (no `cvss` dep)
+  guard.py         autonomous-mode safety: classify() (ALLOW/CONFIRM/BLOCK) + Budget
+                   + classify_mcp() + mcp_targets_out_of_scope() for MCP calls
+  mcp.py           Model Context Protocol client (stdio + Streamable HTTP), McpManager,
+                   config parsing + default_config_path()/merge_mcp_configs() — stdlib + requests
+  mcp_defaults.json  bundled curated FREE no-key servers (ddg/fetch/wikipedia/think),
+                   auto-loaded when MCP is on; pinned npx versions (package data)
+  arsenal.py       recon tool catalog -> tool_index()/arsenal_briefing() + PLAYBOOKS
+                   (the HexStrike "decision engine" as static, guard-safe data)
+  research.py      OSINT research sub-agent: RESEARCH_SYSTEM_PROMPT + run_research()
+                   (relace-search-style "sub-agent -> oracle"; reuses the guard)
+  packages.py      detect_package_manager() (brew/apt/pkg/dnf/…) + install command
+  session.py       JSONL audit log + Markdown report + token-usage accounting
+  render.py        terminal Markdown renderer (tables, headings, code, wrapping)
+  bidi.py          display-only RTL fix: Arabic shaping + BiDi reorder (MUHGPT_BIDI)
+  ui.py            ANSI color theme with TTY / NO_COLOR detection
+tests/             pytest suite (network + model are faked; runs offline)
 ```
 
-## Setup
+## Two modes
+
+**HITL (default).** Every command/install/file-read routes through a `[y/N]`
+confirm (`tools.console_confirm`). The model cannot cause a side effect alone.
+The guard is **bypassed** in this mode — behavior is exactly as before autonomous
+mode existed (this is why all the original tests pass untouched).
+
+**Autonomous (`--auto` or `MUHGPT_AUTO=1`).** The agent plans and runs read-only
+recon end-to-end without per-step approval. A safety guard ([guard.py](muhgpt/guard.py))
+classifies every command **at the execution boundary, independent of the model**,
+so it holds even under prompt injection from scanned output:
+- **BLOCK** — destructive/irreversible/weaponized/`sudo` (denylist regexes). Never
+  runs, never prompts. No disable flag — to run one, drop to HITL.
+- **ALLOW** — only `guard.SAFE_RECON` single-purpose recon tools (nmap, dig, httpx,
+  sslscan, subfinder, nikto, plus the expanded arsenal: dnsx, naabu, tlsx, asnmap,
+  cdncheck, katana, nuclei, …) with **no shell metacharacters**. Auto-runs.
+- **CONFIRM** — everything else still prompts: unknown binaries, any pipe/chaining,
+  installs, local file reads, and the Swiss-army tools `curl`/`wget`/`openssl`
+  (their flags are file read/write/exfil/RCE primitives, so they're never
+  auto-run — see the red-team note below).
+
+**MCP tools (opt-in, `--mcp`).** When an MCP client is attached, discovered tools
+(`mcp__<server>__<tool>`) are NOT shell strings, so they bypass `classify()` and get
+their own model-independent verdict via `guard.classify_mcp()`: weaponized tool/server
+names (exploit/shell/payload/brute-force regex) → **BLOCK**; only names the operator
+listed in `MUHGPT_MCP_AUTO_TOOLS` → **ALLOW**; everything else → **CONFIRM** (the safe
+default — treated as conservatively as curl/wget, never auto-run). `mcp_targets_out_of_scope()`
+downgrades an ALLOW to CONFIRM when a structured argument names an out-of-scope host.
+Every MCP call still flows through `tools._approve_and_run_mcp` (HITL confirm or auto
+classification + budget + `mcp_call` audit event). MuhGPT never auto-installs/launches a
+server; tool descriptions/outputs are untrusted.
+
+Bounded by a `guard.Budget` (rounds/commands/installs/wall-clock/blocks) and a
+**no-progress guard**: after `auto_max_idle` consecutive rounds with no command
+actually executed (stuck talking, or all blocked/declined/failed), the run halts.
+Autonomous turns loop until the model replies `DONE`, the budget runs out, or
+no-progress triggers.
+
+**YOLO (`--yolo` or `MUHGPT_AUTO_YOLO=1`, implies `--auto`).** Auto-approves the
+CONFIRM tier too — only the **BLOCK denylist** and **secret-file reads**
+(`guard.is_secret_path`) stay gated. Centralized in `ToolRegistry._auto_approves`
+(ALLOW always auto-runs; CONFIRM auto-runs only under yolo; BLOCK never). `_read_file`
+auto-reads any non-secret file in yolo. `self._yolo = yolo and auto` (inert without
+auto). Budget still bounds the run. High-trust, trusted-targets-only — the CONFIRM
+tier exists precisely because those commands (curl/wget/openssl/pipes) are exfil/RCE
+primitives, so yolo accepts injection risk by design.
+
+### Guard invariants (don't regress these)
+- The verdict is computed inside `ToolRegistry._approve_and_run` from the literal
+  command string — never trust the model's framing.
+- **Allowlist-first is load-bearing:** a destructive command that dodges the
+  denylist still can't auto-run unless its leading binary is in `SAFE_RECON` and
+  it has no metacharacters. Keep `SAFE_RECON` to network/recon tools that only
+  emit their own output — never add file readers (cat/grep/…), interpreters
+  (awk/sed/python/sh), fuzzers, or the Swiss-army tools (curl/wget/openssl).
+- BLOCK reasons (raw regex) go to the audit log only; the model/operator see a
+  generic message (don't reveal the rule to a possibly-injected model).
+- `guard.targets_out_of_scope()` softly downgrades an ALLOW to CONFIRM when a
+  command names a host outside `session.scope` (defense against injected scope
+  pivots). Conservative: only fires for parseable domain/IP/CIDR scopes.
+- **MCP keeps the same invariants on its own track:** `classify_mcp()` is
+  denylist-first (BLOCK beats the operator allowlist) and defaults to CONFIRM;
+  never widen the auto-run set except via the operator's `MUHGPT_MCP_AUTO_TOOLS`.
+  When expanding `SAFE_RECON`, only add tools that emit their own output — the
+  arsenal additions (dnsx/naabu/tlsx/asnmap/cdncheck/mapcidr/httprobe/katana/
+  hakrawler/gospider/cero/nuclei) were chosen on that rule; `nuclei -code`
+  (code-template RCE) is denylisted. Re-run the red-team pass after any change.
+
+## Skills & routing (main.py)
+
+- **Recon skills:** `/recon /subdomains /dns /tls /ports /web <target>` expand a
+  playbook objective (`_SKILLS`) and run it through the agent. Targets are
+  validated for hygiene but only reach the prompt; the guard governs actual shell.
+- **Attack-chain playbooks:** `/pentest /osint /cloud /api /vulns <target>` are
+  sourced from `arsenal.PLAYBOOKS` and merged into `_SKILLS` at import, so they
+  resolve through the same `_expand_skill` path — pure data, no new code path.
+- **MCP:** `--mcp` (or `MUHGPT_MCP_ENABLED`) builds an `McpManager` (`_build_mcp`,
+  failures are non-fatal warnings) passed to `ToolRegistry(mcp=…)`; `/mcp` lists
+  servers/tools; subprocesses closed in `try/finally`. The agent needs no change —
+  it only reads `tools.schemas`/`dispatch`. When enabled, `_build_mcp` loads the
+  bundled curated free servers (`mcp_defaults.json` via `default_config_path()`)
+  unless `--no-mcp-defaults`/`MUHGPT_MCP_DEFAULTS=0`, then `merge_mcp_configs`
+  layers the operator's `--mcp-config` on top (same name → user overrides). Keep
+  bundled servers to READ-ONLY data sources with pinned versions; they still route
+  through `classify_mcp` (CONFIRM default). Never bundle exploit kitchen-sinks.
+- **Assistant skills:** `/code /analyze /debug /explain /write /optimize /security
+  <free text>` (`_PROMPT_SKILLS`) run as an isolated one-off via `Agent.ask_once`:
+  the skill's role is the SYSTEM prompt (NOT the pentest persona) on a fresh,
+  tool-free `[system, user]` context never appended to the engagement history —
+  so a weak model reliably adopts the role instead of being dominated by the
+  pentest persona. Recon skills resolve in `_expand_skill`; assistant skills in
+  `_expand_prompt_skill`. `_drive` runs either (a `run_turn` or `ask_once` thunk).
+- **Install routing:** `/install <pkg>` and bare "install X" / "instala o X"
+  (`_match_install_intent`) route straight to `install_package`, bypassing the
+  model (which is weak at tool-calling). Plus deterministic auto-recovery: a
+  command that exits 127 triggers an offer to install the missing tool and re-run.
+
+## Knowledge, memory & validated reporting (Strix-inspired)
+
+Ported as guard-safe, stdlib-only ideas from usestrix/strix — its *brains*, not its
+weight (no Docker/multi-agent/browser/proxy):
+
+- **Skills KB:** `muhgpt/skills/*/*.md` vuln playbooks loaded on demand via the
+  `load_skill` tool (`knowledge.py`). `knowledge.skills_index()` is injected into the
+  system prompt so the model knows what it can pull; `/skills [name]` lists/previews.
+  Pure prompt data — no new execution power. New playbooks = drop a `.md` file in.
+- **Scratchpad:** `note` / `recall_notes` tools → `session.notes` (durable across
+  history trim). `load_skill`/`note`/`recall_notes` return `executed=False` so they
+  never reset the autonomous no-progress guard (they're prep, not progress).
+- **Validated reporting:** `report_vulnerability` REQUIRES a PoC ("no PoC, no finding"),
+  dedups by title, and computes a real CVSS 3.1 score via `cvss.py` (stdlib). Stored in
+  `session.vulnerabilities`, rendered severity-sorted in the report.
+- **Scan modes:** `--scan-mode quick|standard|deep` / `MUHGPT_SCAN_MODE` →
+  `arsenal.scan_mode_briefing()` injected into the prompt via `Agent(scan_mode=…)`.
+
+## Research sub-agent (relace-search-style OSINT delegate)
+
+A second model the lead agent delegates a single OSINT question to — the
+"sub-agent → oracle" pattern (Relace Search does this for *code*; here it's for
+*web/OSINT*). It runs its own bounded search loop and hands back a distilled,
+sourced brief, keeping raw search output out of the lead's context.
+
+- **Off by default.** Active when `--research` / `MUHGPT_RESEARCH_ENABLED=1`, or
+  implicitly when a model is named via `--research-model` / `MUHGPT_RESEARCH_MODEL`.
+  When active, `ToolRegistry` advertises the `research` tool and `/research <q>`
+  runs the sub-agent directly. Best paired with `--mcp` (web search/fetch).
+- **Configurable model.** `config.research_client_settings()` clones `Settings`
+  with `research_model` / `research_base_url` / `research_api_key`, each falling
+  back to the main endpoint — so it works on the main model out of the box, or you
+  point it at relace/relace-search (OpenRouter), Perplexity, etc.
+- **[research.py](muhgpt/research.py):** `run_research(query, *, client, tools,
+  session, budget, scan_mode)` builds a quiet `autonomous=True` `Agent` on
+  `RESEARCH_SYSTEM_PROMPT`, `stream=False`, and runs it. Returns the brief string.
+- **Dedicated sub-registry (not a view).** `tools._research` builds a SEPARATE
+  `ToolRegistry` sharing the engagement's `session`/`mcp`/`classifier`/package
+  manager, with `research_client=None` (so it advertises **no `research` tool** →
+  can't recurse) and a fresh `Budget` from `research_max_rounds`/`_max_commands`/
+  `_wall_clock_s` shared with the sub-`Agent` (so round AND command AND wall-clock
+  caps are all genuinely enforced — mirrors how `main.py` pairs the lead Agent +
+  registry on one budget). `tools._research` lazily imports `research` to avoid the
+  `tools → research → agent` import cycle.
+- **Guard invariants preserved, with one hardening.** Every sub-agent command
+  still flows through `classify()`/`classify_mcp()` (model-independent) and the
+  parent's approval policy: it **inherits `auto`** (HITL → each command prompts;
+  `--auto` → ALLOW recon auto-runs) but **never inherits `yolo`** (`yolo=False` on
+  the sub-registry) — the researcher ingests untrusted web content, so its
+  CONFIRM-tier primitives (curl/wget/non-allowlisted MCP) stay gated even in a YOLO
+  session. Each delegation also charges one unit of the engagement command budget,
+  so the number of research calls per run is bounded too. BLOCK and scope
+  downgrades apply unchanged.
+
+## One-shot mode
+
+`--objective "TEXT"` (or `--objective "/recon target"`) runs a single objective
+non-interactively then exits, exporting the report automatically. With `--auto`
+the flag itself is the autonomous consent (no interactive `[y/N]`). For cron/CI.
+
+## Run & test
 
 ```bash
-cd muhgpt_cli
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# edit .env and set MUHGPT_API_KEY
+python3 main.py                                   # interactive HITL
+python3 main.py --auto                            # interactive autonomous
+python3 main.py --auto --objective "/recon x"     # one-shot, exports report
+python3 main.py --mcp --mcp-config mcp.json       # with MCP servers attached
+python3 -m pytest -q                              # full suite (offline)
+python3 -m pytest tests/test_guard.py -q          # one file
 ```
 
-`.env` format:
-
-```ini
-MUHGPT_API_KEY=mghp_your_key_here
-MUHGPT_BASE_URL=https://api.muhgpt.com/v1
-MUHGPT_MODEL=muh-chat
-```
-
-The API key is read from the environment only; nothing is hardcoded. See
-`.env.example` for the full set of optional tuning variables (timeouts, retries,
-`MUHGPT_MAX_HISTORY_MESSAGES`, and `MUHGPT_TEMPERATURE=none` to omit the field
-for reasoning models that reject it).
-
-Optionally install it as the `muhgpt` command:
-
-```bash
-pip install -e .
-muhgpt --version
-```
-
-## Step-by-step quick start
-
-From zero to a finished recon report. Use only against systems you are
-**authorized** to test (the examples use `scanme.nmap.org`, which Nmap provides
-for exactly this).
-
-### 1. Install and configure
-
-```bash
-git clone <repo> && cd muhgpt_cli
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # then edit .env and set MUHGPT_API_KEY
-```
-
-### 2. Start a session (manual mode — the safe default)
-
-```bash
-python main.py
-```
-
-You get a `[you@muhgpt] ❯` prompt. Type `/help` any time. **Every** command the
-model wants to run shows up in a box and waits for your `[y/N]` — nothing executes
-without your approval.
-
-### 3. Run your first recon
-
-Type a **skill** followed by an authorized target:
-
-```text
-/recon scanme.nmap.org
-```
-
-The agent plans and proposes commands (whois → dig → nmap → httpx …); press `y`
-to run each. Findings are saved as it goes. Single-purpose skills: `/subdomains`,
-`/dns`, `/tls`, `/ports`, `/web`. Bigger attack-chain playbooks: `/pentest`,
-`/osint`, `/cloud`, `/api`, `/vulns`.
-
-> Declare the target as the scope so the agent knows it's authorized:
-> `python main.py --scope scanme.nmap.org`. The agent will refuse hosts that are
-> clearly outside the confirmed scope.
-
-### 4. Use the vulnerability playbooks (skills)
-
-MuhGPT ships a knowledge base of per-class playbooks (find → **validate** →
-report). List and preview them:
-
-```text
-/skills              # xss, sqli, ssrf, idor, ssti, xxe, rce, auth-jwt, …
-/skills sqli         # preview the SQL-injection playbook
-```
-
-During a run the agent loads the right one itself (the `load_skill` tool) before
-hunting a bug class — that's where its techniques, payloads, and the
-"no PoC, no finding" validation method come from. Add your own by dropping a
-Markdown file into `muhgpt/skills/`.
-
-### 5. Choose how deep to go (scan modes)
-
-```bash
-python main.py --scan-mode quick      # fast, breadth, high-impact only
-python main.py --scan-mode standard   # balanced (default)
-python main.py --scan-mode deep       # exhaustive + vulnerability chaining
-```
-
-When the agent confirms a real, **proven** vulnerability it files it with
-`report_vulnerability` — which requires a proof of concept and auto-computes a
-**CVSS 3.1** score. It also keeps a scratchpad (`note` / `recall_notes`). All of
-this lands in the exported report (a severity-sorted *Vulnerabilities* section,
-plus *Notes & Methodology*).
-
-### 6. Ask it anything (no target needed)
-
-Assistant skills run a one-off in a dedicated role:
-
-```text
-/explain how TLS session resumption works
-/code a python script that parses nmap -oX output
-/security  <paste a code snippet to review>
-```
-
-### 7. Add web search + OSINT (free MCP servers, no API key)
-
-Requires Node/`npx`. Just add `--mcp` — a curated free set loads automatically
-(DuckDuckGo search, fetch, Wikipedia, sequential-thinking):
-
-```bash
-python main.py --mcp
-```
-
-Check what's connected with `/mcp`, then let the model search the web:
-
-```text
-search the web for recent nginx CVEs and summarize them
-```
-
-Make it always-on by adding `MUHGPT_MCP_ENABLED=1` to `.env` (then plain
-`python main.py` already has MCP).
-
-### 8. Plug in your own MCP servers (optional)
-
-Create `mcp.json` (the standard `mcpServers` shape) and keep API keys in `.env`,
-not in the file:
-
-```json
-{ "mcpServers": { "shodan": { "command": "npx", "args": ["-y", "shodan-mcp"] } } }
-```
-
-```bash
-python main.py --mcp --mcp-config mcp.json
-```
-
-Your servers are **merged on top** of the bundled free ones. Use
-`--no-mcp-defaults` to load only yours.
-
-### 9. Go hands-off (autonomous mode)
-
-Give one objective and let it run read-only recon end-to-end without approving
-each step (you acknowledge the scope once at launch; destructive commands stay
-blocked, installs still ask):
-
-```bash
-python main.py --auto --scope scanme.nmap.org
-```
-
-### 10. Maximum hands-off (YOLO)
-
-Auto-approves everything **except** the destructive denylist and secret-file
-reads. Only against targets you fully trust:
-
-```bash
-python main.py --yolo --scope your-lab.example.com
-```
-
-### 11. One-shot (for cron / CI)
-
-Run a single objective, export the report, and exit — no prompts:
-
-```bash
-python main.py --auto --objective "/recon scanme.nmap.org" --scope scanme.nmap.org
-```
-
-### 12. Get your report
-
-Inside a session type `/report` (and you're offered an export on exit). Reports
-are written to `reports/report-*.md`, with a full JSONL audit log next to them.
-
-## Run
-
-```bash
-python main.py
-```
-
-The session starts immediately. In-session commands: `/help`, `/install <pkg>`,
-`/mcp`, `/skills`, `/scope`, `/report`, `/exit`. The operator handle defaults to your login name and
-the report scope label defaults to `unrestricted`; override either with
-`--operator NAME` / `--scope "target(s)"`. Run `python main.py --version` to
-print the version.
-
-**Recon skills.** Built-in `/<skill> <target>` commands expand into a ready-made
-recon playbook and run it through the agent (hands-off under `--auto`,
-step-approved otherwise): `/recon`, `/subdomains`, `/dns`, `/tls`, `/ports`,
-`/web`. For example `/recon example.com` runs WHOIS → DNS → subdomains → TLS →
-nmap → HTTP fingerprinting and saves findings to the report.
-
-**Attack-chain playbooks.** Larger HexStrike-style multi-tool objectives that
-chain the recon arsenal end-to-end (also `/<skill> <target>`): `/pentest` (full
-attack-surface chain), `/osint` (passive profile, no active scan), `/cloud`
-(internet-facing cloud footprint), `/api` (map + probe an API), `/vulns`
-(non-destructive nuclei/nikto vulnerability scan). They run through the same
-guard as everything else — nothing in a playbook can bypass approval or the
-denylist.
-
-**Assistant skills.** General-purpose `/<skill> <your text>` commands run your
-request under a dedicated role — its own system prompt, isolated from the pentest
-context — so the model answers in-character: `/code`, `/analyze`, `/debug`,
-`/explain`, `/write`, `/optimize`, `/security`. For example `/security review this
-login handler …` runs a focused security review. `/help` lists everything.
-
-Output is colorized (gradient banner, highlighted command-approval box, dimmed
-model reasoning). Colors auto-disable when output isn't a terminal, and can be
-turned off with `--no-color` or the `NO_COLOR` / `MUHGPT_NO_COLOR` env vars —
-audit logs and Markdown reports are always written plain.
-
-Replies **stream token-by-token** as the model produces them. On a terminal,
-once a reply finishes it is re-rendered in place as Markdown: pipe tables drawn
-with box borders and aligned columns, plus headings, bullet/numbered lists,
-blockquotes, fenced code blocks, and inline bold/italic/code. (If the reply is
-taller than the screen, or output is piped, the raw stream is kept as-is.) Use
-`--no-stream` (or `MUHGPT_STREAM=false`) to buffer the whole reply and render it
-in one shot. Rendering is display-only — raw Markdown is what gets logged and
-saved to reports.
-
-**Right-to-left (Arabic) replies.** Most terminals lay text out left-to-right and
-don't implement the Unicode BiDi algorithm or Arabic shaping, so an Arabic reply
-shows up with its letters mirrored and disconnected. MuhGPT fixes this at the
-display layer: lines containing RTL text are reshaped (contextual Arabic forms +
-lam-alef ligatures) and reordered so they read correctly even on a non-BiDi
-terminal. It's pure-stdlib and **display-only** — audit logs and saved reports
-stay in logical order. Controlled by `MUHGPT_BIDI` (`auto` default / `on` / `off`);
-set it to `off` if your terminal already does BiDi, to avoid double-reversal.
-
-When the API reports token usage, a dim `↑prompt ↓completion · session total`
-line is printed after each turn, and a **Token Usage** section is appended to
-the exported report. Set `MUHGPT_PRICE_PROMPT_PER_1M` / `MUHGPT_PRICE_COMPLETION_PER_1M`
-(USD per 1M tokens) to also show an estimated `~$cost` per turn and per session.
-
-## How it works
-
-- **Native tool calling.** Instead of parsing ```` ```bash ```` blocks out of prose,
-  the model is given four tools — `execute_terminal_command`, `install_package`,
-  `read_file`, `save_report` — and invokes them through the standard `tool_calls`
-  interface. The agent feeds each tool's output back as a `tool` message, so the
-  model can interpret results and pick the next step. That round-trip is the
-  feedback loop; it is capped per turn by `MUHGPT_MAX_TOOL_ROUNDS`. Any reasoning
-  the model narrates alongside its tool calls is printed before each approval
-  prompt, so you see *why* a command is proposed.
-- **Installs missing tools.** When a command fails because its tool isn't
-  installed (exit 127 / "command not found"), the runtime identifies the missing
-  binary, offers to install it via the detected package manager — `brew`,
-  `apt-get`, `pkg` (Termux), `dnf`, `yum`, `pacman`, `apk`, or `zypper` (choosing
-  the right command, with `sudo` only when needed) — and, on approval, installs
-  it and **re-runs the original command automatically**. This recovery is
-  deterministic, so it works even with models that are weak at tool-calling. The
-  model can also call `install_package` directly. Either way the install is shown
-  and approved like any other command before it runs.
-- **Operator-driven installs.** You can also install tools yourself without the
-  model: `/install nmap` (or `/install nmap masscan`), or simply typing a bare
-  request like `install nmap` / `instala o nmap`. These route straight to the
-  package manager through the same `[y/N]` approval — bypassing the model so a
-  weak tool-caller can't refuse. Package names are validated against a strict
-  allowlist before they reach the shell.
-- **Bounded context.** The running conversation is trimmed to the most recent
-  `MUHGPT_MAX_HISTORY_MESSAGES` (default 40, `0` to disable) so long engagements
-  don't silently blow the model's context window or cost. Trimming only cuts on
-  turn boundaries, never splitting a tool call from its result.
-- **Human-in-the-loop (default).** Both command execution and file reads route
-  through a confirmation prompt and only proceed on an explicit `y`. The model
-  cannot cause a side effect on its own.
-- **Autonomous mode (opt-in, `--auto`).** Give one objective and the agent plans,
-  runs read-only recon, installs missing tools, maps the target, and writes the
-  report end-to-end without approving each step. A safety guard classifies every
-  command at the execution boundary — **independently of the model**, so it holds
-  even if scanned output prompt-injects it:
-  - **BLOCK** — destructive/irreversible/weaponized commands (`rm -rf`, `dd`,
-    `mkfs`, fork bombs, `curl … | sh`, disk/`/etc` writes, `~/.ssh` writes, exfil,
-    reverse shells, brute-force/exploit tooling, `sudo`, …) never run and aren't
-    even offered.
-  - **auto-run** — only a curated allowlist of single-purpose read-only recon
-    tools (nmap, whois, dig, httpx, whatweb, subfinder, amass, sslscan, nikto,
-    plus the expanded arsenal: dnsx, naabu, tlsx, asnmap, cdncheck, katana,
-    nuclei, …) with no shell metacharacters.
-  - **CONFIRM** — everything else still stops for your `[y/N]`: unknown binaries,
-    any pipe/chaining, installs, local file reads, the general-purpose tools
-    `curl`/`wget`/`openssl` (whose flags can read/write/exfil files, so they're
-    never auto-run), and any command whose target host looks **outside the
-    declared scope** (a soft guard against injected scope pivots).
-
-  It's bounded by a budget (rounds / commands / installs / wall-clock; see
-  `.env.example`) plus a **no-progress guard** that halts the run if the model
-  goes several rounds without a command actually executing (stuck talking, or all
-  blocked/declined). Abortable with Ctrl-C, fully audit-logged, and requires a
-  one-time scope acknowledgement at launch. The denylist has no disable flag — to
-  run a blocked command, drop back to manual mode. Enable with `--auto` or
-  `MUHGPT_AUTO=1`. Default stays human-in-the-loop.
-- **YOLO mode (opt-in, `--yolo`).** Maximum hands-off: in autonomous mode it
-  auto-approves the **CONFIRM tier too** — curl/wget/openssl, pipes/chaining,
-  installs, and reads of non-secret files all run unattended, with **no per-step
-  prompts**. Two lines stay absolute even here: the **BLOCK denylist** (rm -rf,
-  dd, exfil, reverse shells, `sudo`, …) never runs, and **secret/credential file
-  reads** (`~/.ssh`, `.env`, `*.pem`, …) still require a prompt. Still bounded by
-  the same budget. This trades away the CONFIRM safety layer, so scanned output
-  could prompt-inject the model into running a CONFIRM-tier command — use it only
-  against targets you fully trust (your own lab/infra), never untrusted hosts.
-  Enable with `--yolo` (implies `--auto`) or `MUHGPT_AUTO_YOLO=1`.
-- **MCP client (opt-in, `--mcp`).** Connect to external [Model Context
-  Protocol](https://modelcontextprotocol.io) servers and let the model call their
-  tools alongside the built-ins. Both **stdio** (local subprocess) and **HTTP**
-  servers are supported — implemented in pure stdlib + `requests`, no SDK.
-  Discovered tools are namespaced `mcp__<server>__<tool>` and routed through the
-  **same guard** as shell commands: in `--auto` every MCP call defaults to a human
-  `[y/N]` (never auto-runs), tool names that look weaponized
-  (exploit/shell/payload/brute-force) are **BLOCKED**, out-of-scope target
-  arguments downgrade to a confirm, and only tools you list in
-  `MUHGPT_MCP_AUTO_TOOLS` may auto-run. Tool descriptions and outputs are treated
-  as untrusted input. `/mcp` lists connected servers and tools. Off by default.
-  - **Batteries included.** When you enable MCP, a curated set of **free,
-    no-API-key** servers loads automatically (needs Node/`npx`): **ddg**
-    (DuckDuckGo web search — deep search / OSINT), **fetch** (URL → html/markdown/
-    txt/json — recon), **wikipedia** (search + read), and **think** (sequential
-    reasoning). So `python main.py --mcp` works out of the box with no config.
-    Versions are pinned; disable the bundle with `--no-mcp-defaults` /
-    `MUHGPT_MCP_DEFAULTS=0`.
-  - **Add your own.** Point `--mcp-config mcp.json` (or `MUHGPT_MCP_CONFIG`) at a
-    standard `{"mcpServers": {…}}` file; your servers are **merged on top** of the
-    bundled ones (a same-named entry overrides the default). Great for keyed
-    OSINT/recon servers (Shodan, VirusTotal, Brave, a pinned nmap/nuclei wrapper,
-    …) — put the API keys in `.env`, not in the JSON. MuhGPT never auto-installs a
-    server; review and pin them yourself.
-- **One-shot / scripting (`--objective`).** Run a single objective and exit,
-  exporting the report automatically: `python main.py --auto --objective "/recon
-  example.com"`. Non-interactive (no prompts; `--auto` is the consent) — for cron
-  or CI.
-- **Auditing + reporting.** Every message, proposed command (approved or not), and
-  finding is appended to `reports/session-*.jsonl` as it happens. `save_report`
-  builds the human-facing report, exported to `reports/report-*.md`.
-- **Vulnerability playbooks (skills).** A bundled knowledge base of per-class
-  playbooks (XSS, SQLi, SSRF, IDOR, SSTI, XXE, RCE, JWT/auth, path-traversal,
-  CSRF, open-redirect, NoSQLi) — each with where-to-look, detection, **validation
-  ("no PoC, no finding")**, payloads, and remediation. The model loads one on
-  demand via the `load_skill` tool; browse them with `/skills` (or `/skills xss`
-  to preview). The available names are injected into the system prompt so even a
-  weak model knows what it can pull in. Pure prompt data — grants no new execution
-  power. (Inspired by [Strix](https://github.com/usestrix/strix)'s skills.)
-- **Scratchpad memory.** `note` / `recall_notes` give the agent durable
-  engagement memory (leads, plan, in-scope creds) that survives history trimming —
-  rendered in the report under *Notes & Methodology*.
-- **Validated reporting + CVSS.** `report_vulnerability` files a structured
-  finding that **requires a proof of concept** and computes a real **CVSS 3.1**
-  base score/severity/vector (pure stdlib, no dependency), de-duplicating by
-  title. Vulnerabilities render in their own severity-sorted report section.
-- **Scan modes.** `--scan-mode quick|standard|deep` (or `MUHGPT_SCAN_MODE`) shapes
-  the agent's depth — `quick` (breadth, fast), `standard` (balanced), `deep`
-  (exhaustive + vulnerability chaining).
-
-### A note on `shell=True`
-
-`execute_terminal_command` runs through the shell so real recon one-liners (pipes,
-redirects, globs) work. The safety boundary is the mandatory approval prompt: you
-see the exact command string before it can run. Review each command before
-approving — only run this against systems you are authorized to test.
-
-## Tests
-
-The suite fakes the model and the HTTP layer, so it runs offline and fast:
-
-```bash
-pip install -e ".[dev]"   # or: pip install pytest ruff
-python -m pytest
-ruff check .              # lint (config in pyproject.toml)
-```
-
-## Termux / Android
-
-Works under Termux. If `python` is missing: `pkg install python`. The optional
-`MUHGPT_COMMAND_TIMEOUT` is handy on mobile to stop long scans. Everything else is
-pure-Python with two small dependencies.
-
-## License
-
-Released under the [MIT License](LICENSE). For **authorized** security testing
-only — you are responsible for having permission to test any target.
+Config: copy `.env.example` to `.env`, set `MUHGPT_API_KEY`. All knobs are
+`MUHGPT_*` env vars (see `.env.example`), also settable as CLI flags where shown.
+
+## Testing conventions
+
+- Network and the model are faked — tests never hit a real endpoint. Use the
+  fakes in `tests/conftest.py` (`FakeSession`, `FakeResponse`, `FakeTools`,
+  scripted clients). Drive SSE with `data:`-prefixed line lists.
+- The guard's classifier is injectable (`ToolRegistry(classifier=…)`) and the
+  budget is constructable — test wiring with deterministic verdicts, and test the
+  denylist/allowlist content separately in `tests/test_guard.py`.
+- When you touch the guard, re-run a red-team pass: feed candidate destructive
+  commands through `guard.classify()` and confirm none return `ALLOW` except
+  legitimate read-only recon. Do the MCP equivalent through `guard.classify_mcp()`.
+- MCP is tested with a real stdio server in `tests/test_mcp.py` (`FAKE_SERVER`
+  script launched as a subprocess) and a fake `requests` session for HTTP;
+  `tests/test_tools.py` has a `FakeMcp` manager to exercise `_approve_and_run_mcp`
+  without spawning a process. Keep the pure-stdlib constraint: no `mcp` SDK.
+
+## Reporting / output
+
+- All output styling is at the `print` layer (`ui`, `render`); the audit log
+  (`reports/session-*.jsonl`) and the Markdown report (`reports/report-*.md`) are
+  always plain. Colors auto-disable off-TTY and with `--no-color` / `NO_COLOR`.
+- Model replies are streamed token-by-token and re-rendered as Markdown in place
+  on a TTY; `--no-stream` buffers then renders.
+- RTL (Arabic) replies pass through `bidi.to_display()` at the render call sites
+  (stream re-render + `--no-stream` print), TTY-only so piped/saved output stays
+  logical. Like colors, it's display-only — never feed its result back into logic
+  or reports. `MUHGPT_BIDI=off` disables it for terminals that already do BiDi.
